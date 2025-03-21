@@ -11,7 +11,7 @@ Objective metrics were computed using pyiqa (as outlined in the scripts inside t
       howpublished = "[Online]. Available: \url{https://github.com/chaofengc/IQA-PyTorch}"
     }
     
-The results of the objective metrics can be found in the **../metric_values** folders. The example code leverages data from CID 2013 (see [Zenodo][2] and the [home page of the research group][3]).
+The results of the objective metrics can be found in the **../metric_values** folders. The example code leverages data from CID 2013 (see [Zenodo][1] and the [home page of the research group][2]).
 
 ### Citation
 
