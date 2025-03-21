@@ -1,6 +1,6 @@
 ## README
 
-The whole repository can be cloned/downloaded as a zip file (see also [OSF][1]). The code is written in Python and relies mainly on NumPy, SciPy, and pandas (+Matplotlib for visualizations). A Go implementation with basic functionality is also provided.
+The whole repository can be cloned/downloaded as a zip file (see also OSF - https://osf.io/2x4g8/). The code is written in Python and relies mainly on NumPy, SciPy, and pandas (+Matplotlib for visualizations). A Go implementation with basic functionality is also provided.
 
 Objective metrics were computed using pyiqa (as outlined in the scripts inside the **Python/pyiqa_scripts** folder. For more information about pyiqa, see:
 
@@ -29,6 +29,5 @@ If you found the implementation useful, please cite:
     }
 
 
-  [1]: https://osf.io/2x4g8/ "OSF"
-  [2]: https://zenodo.org/records/2647033 "CID 2013 on Zenodo"
-  [3]: https://researchportal.helsinki.fi/en/publications/cid2013-a-database-for-evaluating-no-reference-image-quality-asse "CID 2013 research group home page"
+  [1]: https://zenodo.org/records/2647033 "CID 2013 on Zenodo"
+  [2]: https://researchportal.helsinki.fi/en/publications/cid2013-a-database-for-evaluating-no-reference-image-quality-asse "CID 2013 research group home page"
