@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "correlation_with_confidence"
-version = "0.1.0"
+version = "1.0.1"
 description = "Bootstrap confidence intervals for correlation coefficients between subjective and objective scores, with a fast Rust core."
 readme = "README.md"
 requires-python = ">=3.9"
