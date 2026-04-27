@@ -9,6 +9,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"runtime/pprof"
 	"sort"
@@ -22,20 +23,16 @@ import (
 	"gonum.org/v1/gonum/stat/distuv"
 )
 
-// SceneData holds the information for each scene/stimulus
-type SceneData struct {
-	Name       string
-	Mean       float64
-	Std        float64
-	RawScores  []float64
-	HasRawData bool
-}
+// ---------------------------------------------------------------------------
+// CLI
+// ---------------------------------------------------------------------------
 
-var cpuprofile = flag.String("cpuprofile", "", "write CPU profile to file")
-var memprofile = flag.String("memprofile", "", "write memory profile to file")
+var (
+	cpuprofile = flag.String("cpuprofile", "", "write CPU profile to file")
+	memprofile = flag.String("memprofile", "", "write memory profile to file")
+)
 
 func main() {
-
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
 	objectiveFile := flag.String("objective", "objective_scores.csv", "Path to the objective scores")
@@ -44,14 +41,17 @@ func main() {
 	subjectiveFile := flag.String("subjective", "subjective_scores.csv", "Path to the subjective scores")
 	flag.StringVar(subjectiveFile, "s", "subjective_scores.csv", "Path to the subjective scores (short)")
 
-	nBootstrap := flag.Int("num_bootstraps", 14999, "Number of bootstrap samples")
-	flag.IntVar(nBootstrap, "nb", 14999, "Number of bootstrap samples (short)")
+	nBootstrap := flag.Int("num_bootstraps", 14999, "Number of outer bootstrap samples")
+	flag.IntVar(nBootstrap, "nb", 14999, "Number of outer bootstrap samples (short)")
 
-	bootstrapScenes := flag.Bool("boostrap_scenes", false, "If to compute scene bootstrapping")
-	flag.BoolVar(bootstrapScenes, "b", false, "If to compute scene bootstrapping (short)")
+	nInner := flag.Int("inner_bootstraps", 1499, "Number of inner bootstraps over votes")
 
-	nVotes := flag.Int("votes", 15, "Number of votes per stimuli")
-	flag.IntVar(nVotes, "nv", 15, "Number of votes per stimuli (short)")
+	bootstrapScenes := flag.Bool("bootstrap_scenes", false, "Also bootstrap scenes (sample with replacement across stimuli)")
+	flag.BoolVar(bootstrapScenes, "boostrap_scenes", false, "Legacy misspelled alias of -bootstrap_scenes")
+	flag.BoolVar(bootstrapScenes, "b", false, "Also bootstrap scenes (short)")
+
+	nVotes := flag.Int("votes", 15, "Number of votes per stimulus to synthesize when only mean/std is given")
+	flag.IntVar(nVotes, "nv", 15, "Number of votes per stimulus (short)")
 
 	lowerBound := flag.Float64("lower_bound", 0, "Lower bound of the rating scale")
 	flag.Float64Var(lowerBound, "l", 0, "Lower bound of the rating scale (short)")
@@ -59,448 +59,404 @@ func main() {
 	upperBound := flag.Float64("upper_bound", 100, "Upper bound of the rating scale")
 	flag.Float64Var(upperBound, "u", 100, "Upper bound of the rating scale (short)")
 
-	pearsonCorr := flag.Bool("pearson", false, "If to compute the Pearson correlation")
-	flag.BoolVar(pearsonCorr, "r", false, "If to compute the Pearson correlation (short)")
+	pearsonCorr := flag.Bool("pearson", false, "Compute Pearson correlation")
+	flag.BoolVar(pearsonCorr, "r", false, "Compute Pearson correlation (short)")
 
-	spearmanCorr := flag.Bool("spearman", false, "If to compute the Spearman correlation")
-	flag.BoolVar(spearmanCorr, "rho", false, "If to compute the Spearman correlation (short)")
+	spearmanCorr := flag.Bool("spearman", false, "Compute Spearman correlation")
+	flag.BoolVar(spearmanCorr, "rho", false, "Compute Spearman correlation (short)")
 
-	kendallCorr := flag.Bool("kendall", false, "If to compute the Kendall correlation")
-	flag.BoolVar(kendallCorr, "tau", false, "If to compute the Kendall correlation (short)")
+	kendallCorr := flag.Bool("kendall", false, "Compute Kendall correlation")
+	flag.BoolVar(kendallCorr, "tau", false, "Compute Kendall correlation (short)")
 
-	saveTxt := flag.Bool("txt", false, "If to save the output correlation distributions as .txt files")
-	saveCSV := flag.Bool("csv", false, "If to save the output correlation distributions as a combined .csv file")
+	saveTxt := flag.Bool("txt", false, "Save output correlation distributions as .txt files")
+	saveCSV := flag.Bool("csv", false, "Save output correlation distributions as a combined .csv file")
 
-	fileNamePrefix := flag.String("name", "", "What prefix would you like to add to the output .txt files (if any)")
+	fileNamePrefix := flag.String("name", "", "Optional prefix for output files")
+	outputPath := flag.String("output", "", "Output directory")
 
-	outputPath := flag.String("output", "", "Output path to a directory")
+	seed := flag.Int64("seed", 0, "RNG seed (0 = time-based, nonzero = reproducible)")
 
-	// Custom help message
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [options]\n", os.Args[0])
 		flag.PrintDefaults()
 	}
-
-	// Parse the command-line flags
 	flag.Parse()
 
-	// Display help if no arguments are provided
 	if len(os.Args) == 1 {
 		flag.Usage()
 		os.Exit(1)
 	}
-
 	if *lowerBound >= *upperBound {
-		fmt.Println("Error: The lower bound of the rating scale must be smaller than the upper bound.")
-		os.Exit(1) // Exit with a non-zero status to indicate an error
+		fmt.Fprintln(os.Stderr, "Error: lower bound must be smaller than upper bound.")
+		os.Exit(1)
 	}
 
-	// Construct the correlation coefficient list based on user input
-	var corrCoeffs []string
-
-	if *pearsonCorr {
-		corrCoeffs = append(corrCoeffs, "pearson")
-	}
-	if *spearmanCorr {
-		corrCoeffs = append(corrCoeffs, "spearman")
-	}
-	if *kendallCorr {
-		corrCoeffs = append(corrCoeffs, "kendall")
+	// Select coefficients.
+	coeffIDs := selectedCoeffs(*pearsonCorr, *spearmanCorr, *kendallCorr)
+	if len(coeffIDs) == 0 {
+		fmt.Println("No correlation coefficient selected. Defaulting to Pearson.")
+		coeffIDs = []coeffID{pearsonID}
 	}
 
-	// If none were selected, default to Pearson and print a warning
-	if len(corrCoeffs) == 0 {
-		fmt.Println("No correlation coefficient selected. Defaulting to Pearson correlation.")
-		corrCoeffs = append(corrCoeffs, "pearson")
-	}
-
-	// CPU Profiling
+	// Profiling.
 	if *cpuprofile != "" {
 		f, err := os.Create(*cpuprofile)
 		if err != nil {
-			fmt.Println("could not create CPU profile:", err)
-			return
+			fatalf("could not create CPU profile: %v", err)
 		}
 		defer f.Close()
 		if err := pprof.StartCPUProfile(f); err != nil {
-			fmt.Println("could not start CPU profile:", err)
-			return
+			fatalf("could not start CPU profile: %v", err)
 		}
 		defer pprof.StopCPUProfile()
 	}
 
-	numColumns, headers, err := GetCSVHeader(*objectiveFile)
+	// Resolve seed.
+	baseSeed := uint64(*seed)
+	if baseSeed == 0 {
+		baseSeed = uint64(time.Now().UnixNano())
+	}
+
+	// --- Read subjective: auto-detect layout, materialize vote map ---
+	subjectiveVotes, err := parseSubjectiveCSV(*subjectiveFile, *nVotes, *lowerBound, *upperBound, baseSeed)
 	if err != nil {
-		fmt.Println("Error:", err)
-		return
+		fatalf("subjective: %v", err)
 	}
 
-	if numColumns < 2 {
-
-		fmt.Println("Error: The csv with objective scores seems to have less than 2 columns!.")
-
+	// --- Read objective once; all metric columns at once ---
+	objHeaders, objData, err := parseObjectiveCSV(*objectiveFile)
+	if err != nil {
+		fatalf("objective: %v", err)
+	}
+	if len(objHeaders) < 2 {
+		fatalf("objective CSV has fewer than 2 columns")
 	}
 
-	subjectiveScores := readSubjectiveScores(*subjectiveFile)
+	// Pre-compute bootstrapped means for every scene once.
+	bootstrappedSubjective := parallelBootstrap(subjectiveVotes, *nInner, baseSeed+1)
 
-	var subjectiveDistribution map[string][]float64
-
-	if rawDataAvailable(subjectiveScores) {
-
-		subjectiveDistribution = extractRawScores(subjectiveScores)
-
-	} else {
-
-		subjectiveDistribution = processScoresWithPool(subjectiveScores, *nVotes, *lowerBound, *upperBound)
-
+	fileMaps := map[coeffID]map[string]string{
+		pearsonID: {}, spearmanID: {}, kendallID: {},
 	}
 
-	bootstrappedSubjective := parallelBootstrap(subjectiveDistribution, 1499, 0)
-	var fullPath string
-	fileMapPearson := make(map[string]string)
-	fileMapSpearman := make(map[string]string)
-	fileMapKendall := make(map[string]string)
-
-	for id, metric := range headers[1:] {
-
-		objectiveScores := readObjectiveScores(*objectiveFile, id+1)
-
-		distributions := computeCorrelationDistributions(bootstrappedSubjective, objectiveScores, *nBootstrap, *bootstrapScenes, corrCoeffs)
-
-		prefix := ""
-
-		if *fileNamePrefix != "" {
-
-			prefix = *fileNamePrefix + "_" + metric + "_"
-
+	// Iterate metric columns (skip the first, which is the "name" column).
+	for colIdx, metric := range objHeaders[1:] {
+		objective := sliceMetricColumn(objData, colIdx)
+		if len(objective) == 0 {
+			fmt.Printf("Skipping %s (no valid values)\n", metric)
+			continue
 		}
+
+		distributions := computeCorrelationDistributions(
+			bootstrappedSubjective, objective,
+			*nBootstrap, *bootstrapScenes, coeffIDs,
+			baseSeed+uint64(colIdx)+2,
+		)
 
 		fmt.Printf("Results for %s\n", metric)
-		// Print a summary of the computed distributions.
-		for coeff, values := range distributions {
-
+		for _, id := range coeffIDs {
+			values := distributions[id]
 			mean, lower, upper := bootstrapConfidenceInterval(values)
-			fmt.Printf("%s: %.4f\n95%% CI: [%.4f, %.4f]\n", coeff, mean, lower, upper)
-			fmt.Printf("\n")
+			fmt.Printf("%s: %.4f\n95%% CI: [%.4f, %.4f]\n\n", id.name(), mean, lower, upper)
 
-			if *outputPath != "" {
-
-				err := ensureDirExists(*outputPath)
-
-				if err != nil {
-					fmt.Println("Failed to ensure directory exists:", err)
-					return
-				}
-
-				fullPath = filepath.Join(*outputPath, prefix+coeff+".txt")
-
-			} else {
-
-				fullPath = prefix + coeff + ".txt"
-
+			fullPath, err := buildOutputPath(*outputPath, *fileNamePrefix, metric, id.name())
+			if err != nil {
+				fatalf("%v", err)
 			}
-
-			if coeff == "pearson" {
-				fileMapPearson[metric] = fullPath
-			}
-
-			if coeff == "spearman" {
-				fileMapSpearman[metric] = fullPath
-			}
-
-			if coeff == "kendall" {
-				fileMapKendall[metric] = fullPath
-			}
+			fileMaps[id][metric] = fullPath
 
 			if *saveTxt {
-
-				err := saveToText(fullPath, values)
-				if err != nil {
-					fmt.Println("Could not save "+fullPath, err)
+				if err := saveToText(fullPath, values); err != nil {
+					fmt.Fprintln(os.Stderr, "could not save "+fullPath+":", err)
 				}
 			}
-
 		}
-		fmt.Printf("\n")
-
 	}
 
 	if *saveCSV {
-
 		prefix := ""
-
 		if *fileNamePrefix != "" {
-
 			prefix = *fileNamePrefix + "_"
-
 		}
-
-		if len(fileMapPearson) != 0 {
-			CombineTxtToCSV(fileMapPearson, *outputPath, prefix+"pearson.csv")
-		}
-
-		if len(fileMapSpearman) != 0 {
-			CombineTxtToCSV(fileMapSpearman, *outputPath, prefix+"spearman.csv")
-		}
-
-		if len(fileMapKendall) != 0 {
-			CombineTxtToCSV(fileMapKendall, *outputPath, prefix+"kendall.csv")
+		for _, id := range []coeffID{pearsonID, spearmanID, kendallID} {
+			if len(fileMaps[id]) == 0 {
+				continue
+			}
+			if err := CombineTxtToCSV(fileMaps[id], *outputPath, prefix+id.name()+".csv"); err != nil {
+				fmt.Fprintln(os.Stderr, "combine csv:", err)
+			}
 		}
 	}
 
-	// corrResults := computeMeanCorrelation(bootstrappedSubjective, objectiveScores)
-	// fmt.Println("Correlation Results:", corrResults)
-
-	// Memory Profiling
 	if *memprofile != "" {
 		f, err := os.Create(*memprofile)
 		if err != nil {
-			fmt.Println("could not create memory profile:", err)
+			fmt.Fprintln(os.Stderr, "could not create memory profile:", err)
 			return
 		}
 		defer f.Close()
-		pprof.WriteHeapProfile(f)
+		_ = pprof.WriteHeapProfile(f)
 	}
-
 }
 
-func trackTime(start time.Time, name string) {
-	fmt.Printf("%s took %v\n", name, time.Since(start))
+func fatalf(format string, args ...any) {
+	fmt.Fprintf(os.Stderr, "Error: "+format+"\n", args...)
+	os.Exit(1)
 }
 
-// GetCSVHeader reads the header of a CSV file and returns the number of columns and their names.
-func GetCSVHeader(filePath string) (int, []string, error) {
-	// Check if the file exists
-	if _, err := os.Stat(filePath); os.IsNotExist(err) {
-		return 0, nil, fmt.Errorf("file does not exist: %s", filePath)
-	}
+// ---------------------------------------------------------------------------
+// Coefficient enum (cheap dispatch, hoisted out of inner loop)
+// ---------------------------------------------------------------------------
 
-	// Open the file
-	file, err := os.Open(filePath)
+type coeffID int
+
+const (
+	pearsonID coeffID = iota
+	spearmanID
+	kendallID
+)
+
+func (c coeffID) name() string {
+	switch c {
+	case pearsonID:
+		return "pearson"
+	case spearmanID:
+		return "spearman"
+	case kendallID:
+		return "kendall"
+	}
+	return "unknown"
+}
+
+func selectedCoeffs(p, s, k bool) []coeffID {
+	ids := make([]coeffID, 0, 3)
+	if p {
+		ids = append(ids, pearsonID)
+	}
+	if s {
+		ids = append(ids, spearmanID)
+	}
+	if k {
+		ids = append(ids, kendallID)
+	}
+	return ids
+}
+
+// ---------------------------------------------------------------------------
+// CSV parsing
+// ---------------------------------------------------------------------------
+
+// parseSubjectiveCSV auto-detects three layouts:
+//  1. Mean/std: 3 columns with second header matching /mean|mos/i and third /std/i
+//     → vote list synthesized via getSamples(mean, std, nVotes, bounds).
+//  2. Bracketed raw: exactly 2 columns, second header containing "score"
+//     AND first data cell starting with '[' → parse "[v1, v2, ...]".
+//  3. Multi-column votes (default): each row's cols[1:] are individual votes;
+//     empty / "NaN" / "nan" / unparseable cells are skipped.
+func parseSubjectiveCSV(path string, nVotes int, lower, upper float64, seed uint64) (map[string][]float64, error) {
+	f, err := os.Open(path)
 	if err != nil {
-		return 0, nil, fmt.Errorf("unable to open file: %s", err)
+		return nil, err
 	}
-	defer file.Close()
+	defer f.Close()
 
-	// Create a CSV reader
-	reader := csv.NewReader(file)
-
-	// Read the header
-	header, err := reader.Read()
+	r := csv.NewReader(f)
+	r.FieldsPerRecord = -1 // allow ragged rows
+	records, err := r.ReadAll()
 	if err != nil {
-		return 0, nil, fmt.Errorf("unable to read header: %s", err)
+		return nil, err
+	}
+	if len(records) < 2 {
+		return nil, errors.New("subjective CSV has no data rows")
 	}
 
-	// Return the number of columns and the header slice
-	return len(header), header, nil
-}
-
-func rawDataAvailable(subjectiveScores map[string]*SceneData) bool {
-	for _, scene := range subjectiveScores {
-		if !scene.HasRawData {
-			return false // As soon as one is false, return false
-		}
-	}
-	return true // If loop completes, all are true
-}
-
-func extractRawScores(subjectiveScores map[string]*SceneData) map[string][]float64 {
-	result := make(map[string][]float64)
-
-	for _, scene := range subjectiveScores {
-		result[scene.Name] = scene.RawScores
-	}
-
-	return result
-}
-
-// // Optimized version
-// func processScores(subjectiveScores map[string]*SceneData, nVotes int, lowerBound float64, upperBound float64) map[string][]float64 {
-
-// 	defer trackTime(time.Now(), "processScores") // Defer function call
-
-// 	// Pre-allocate the map with expected size
-// 	results := make(map[string][]float64, len(subjectiveScores))
-
-// 	// Use a channel to control concurrent operations
-// 	concurrencyLimit := runtime.GOMAXPROCS(0) // Or another reasonable number
-// 	sem := make(chan struct{}, concurrencyLimit)
-
-// 	var wg sync.WaitGroup
-// 	var mu sync.Mutex
-
-// 	// Create a custom mutex-protected map writer
-// 	mapWriter := func(key string, samples []float64) {
-// 		mu.Lock()
-// 		results[key] = samples
-// 		mu.Unlock()
-// 	}
-
-// 	for key, scene := range subjectiveScores {
-// 		wg.Add(1)
-// 		sem <- struct{}{} // Acquire semaphore
-
-// 		go func(k string, s SceneData) {
-// 			defer wg.Done()
-// 			defer func() { <-sem }() // Release semaphore
-
-// 			// Process data without holding the lock
-// 			samples := getSamples(s.Mean, s.Std, nVotes, lowerBound, upperBound)
-
-// 			// Minimize time spent holding the lock
-// 			mapWriter(k, samples)
-// 		}(key, *scene)
-// 	}
-
-// 	wg.Wait()
-// 	close(sem)
-
-// 	return results
-// }
-
-// Alternative approach using worker pool
-func processScoresWithPool(subjectiveScores map[string]*SceneData, nVotes int, lowerBound float64, upperBound float64) map[string][]float64 {
-
-	// defer trackTime(time.Now(), "processScoresWithPool") // Defer function call
-
-	type workItem struct {
-		key   string
-		scene SceneData
-	}
-
-	results := make(map[string][]float64, len(subjectiveScores))
-	var mu sync.Mutex
-
-	// Create work channel
-	work := make(chan workItem, len(subjectiveScores))
-
-	// Number of worker goroutines
-	numWorkers := runtime.GOMAXPROCS(0)
-	var wg sync.WaitGroup
-
-	// Start workers
-	for i := 0; i < numWorkers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for item := range work {
-				samples := getSamples(item.scene.Mean, item.scene.Std, nVotes, lowerBound, upperBound)
-				mu.Lock()
-				results[item.key] = samples
-				mu.Unlock()
-			}
-		}()
-	}
-
-	// Send work to workers
-	for key, scene := range subjectiveScores {
-		work <- workItem{key, *scene}
-	}
-	close(work)
-
-	wg.Wait()
-	return results
-}
-
-func readObjectiveScores(filename string, id int) map[string]float64 {
-	file, err := os.Open(filename)
-	if err != nil {
-		//fmt.Printf("Error: Unable to open file %s: %v\n", filename, err)
-		panic(err)
-	}
-	defer file.Close()
-
-	reader := csv.NewReader(file)
-	records, err := reader.ReadAll()
-	if err != nil {
-		panic(err)
-	}
-
-	scores := make(map[string]float64)
-	for i, record := range records {
-		if i == 0 { // Skip header
-			continue
-		}
-		name := record[0]
-		score, err := strconv.ParseFloat(record[id], 64)
-		if err != nil {
-			continue
-		}
-		scores[name] = score
-	}
-
-	return scores
-}
-
-func readSubjectiveScores(filename string) map[string]*SceneData {
-	file, err := os.Open(filename)
-	if err != nil {
-		panic(err)
-	}
-	defer file.Close()
-
-	reader := csv.NewReader(file)
-	records, err := reader.ReadAll()
-	if err != nil {
-		panic(err)
-	}
-
-	scores := make(map[string]*SceneData)
 	headers := records[0]
+	rows := records[1:]
 
-	// Determine if we have raw scores or mean/std
-	hasRawScores := len(headers) == 2 && strings.Contains(strings.ToLower(headers[1]), "scores")
-
-	for i, record := range records {
-		if i == 0 { // Skip header
-			continue
-		}
-
-		name := record[0]
-		sceneData := &SceneData{Name: name}
-
-		if hasRawScores {
-			// Parse raw scores from comma-separated string
-			scoreStr := strings.Trim(record[1], "[]")
-			scoreStrs := strings.Split(scoreStr, ",")
-			sceneData.RawScores = make([]float64, 0, len(scoreStrs))
-
-			for _, s := range scoreStrs {
-				score, err := strconv.ParseFloat(strings.TrimSpace(s), 64)
-				if err != nil {
-					continue
-				}
-				sceneData.RawScores = append(sceneData.RawScores, score)
-			}
-			sceneData.HasRawData = true
-
-			// Calculate mean and std from raw scores
-			sceneData.Mean = stat.Mean(sceneData.RawScores, nil)
-			sceneData.Std = stat.StdDev(sceneData.RawScores, nil)
-		} else {
-			// Parse mean and std directly
-			mean, err := strconv.ParseFloat(record[1], 64)
-			if err != nil {
-				continue
-			}
-			std, err := strconv.ParseFloat(record[2], 64)
-			if err != nil {
-				continue
-			}
-			sceneData.Mean = mean
-			sceneData.Std = std
-			sceneData.HasRawData = false
-		}
-
-		scores[name] = sceneData
+	switch layout := detectSubjectiveLayout(headers, rows); layout {
+	case layoutMeanStd:
+		return expandMeanStd(rows, nVotes, lower, upper, seed)
+	case layoutBracketedRaw:
+		return parseBracketedRaw(rows)
+	default:
+		return parseMultiColumnVotes(rows)
 	}
-
-	return scores
 }
 
-// betaDistribution generates samples from a beta distribution with specified mean, standard deviation, and bounds.
-func betaDistribution(mean, std, lower, upper float64, nSamples int) ([]float64, error) {
-	// Input validation
+type subjectiveLayout int
+
+const (
+	layoutMultiColumn subjectiveLayout = iota
+	layoutMeanStd
+	layoutBracketedRaw
+)
+
+var (
+	meanHeaderRE = regexp.MustCompile(`(?i)^(mean|mos)$`)
+	stdHeaderRE  = regexp.MustCompile(`(?i)^(std|stddev|sd)$`)
+)
+
+func detectSubjectiveLayout(headers []string, rows [][]string) subjectiveLayout {
+	if len(headers) == 3 &&
+		meanHeaderRE.MatchString(strings.TrimSpace(headers[1])) &&
+		stdHeaderRE.MatchString(strings.TrimSpace(headers[2])) {
+		return layoutMeanStd
+	}
+	if len(headers) == 2 &&
+		strings.Contains(strings.ToLower(headers[1]), "score") &&
+		len(rows) > 0 && len(rows[0]) > 1 &&
+		strings.HasPrefix(strings.TrimSpace(rows[0][1]), "[") {
+		return layoutBracketedRaw
+	}
+	return layoutMultiColumn
+}
+
+func expandMeanStd(rows [][]string, nVotes int, lower, upper float64, seed uint64) (map[string][]float64, error) {
+	out := make(map[string][]float64, len(rows))
+	rng := rand.New(rand.NewSource(seed))
+	for _, rec := range rows {
+		if len(rec) < 3 {
+			continue
+		}
+		name := rec[0]
+		mean, err1 := strconv.ParseFloat(strings.TrimSpace(rec[1]), 64)
+		std, err2 := strconv.ParseFloat(strings.TrimSpace(rec[2]), 64)
+		if err1 != nil || err2 != nil {
+			continue
+		}
+		out[name] = getSamples(rng, mean, std, nVotes, lower, upper)
+	}
+	return out, nil
+}
+
+func parseBracketedRaw(rows [][]string) (map[string][]float64, error) {
+	out := make(map[string][]float64, len(rows))
+	for _, rec := range rows {
+		if len(rec) < 2 {
+			continue
+		}
+		name := rec[0]
+		inner := strings.Trim(strings.TrimSpace(rec[1]), "[]")
+		parts := strings.Split(inner, ",")
+		votes := make([]float64, 0, len(parts))
+		for _, p := range parts {
+			v, err := strconv.ParseFloat(strings.TrimSpace(p), 64)
+			if err != nil {
+				continue
+			}
+			votes = append(votes, v)
+		}
+		if len(votes) > 0 {
+			out[name] = votes
+		}
+	}
+	return out, nil
+}
+
+func parseMultiColumnVotes(rows [][]string) (map[string][]float64, error) {
+	out := make(map[string][]float64, len(rows))
+	skipped := 0
+	for _, rec := range rows {
+		if len(rec) < 2 {
+			continue
+		}
+		name := rec[0]
+		votes := make([]float64, 0, len(rec)-1)
+		for _, cell := range rec[1:] {
+			s := strings.TrimSpace(cell)
+			if s == "" {
+				continue
+			}
+			if strings.EqualFold(s, "nan") || strings.EqualFold(s, "null") || strings.EqualFold(s, "na") {
+				continue
+			}
+			v, err := strconv.ParseFloat(s, 64)
+			if err != nil || math.IsNaN(v) {
+				continue
+			}
+			votes = append(votes, v)
+		}
+		if len(votes) == 0 {
+			skipped++
+			continue
+		}
+		out[name] = votes
+	}
+	if skipped > 0 {
+		fmt.Fprintf(os.Stderr, "Warning: %d scene(s) had no valid votes and were skipped.\n", skipped)
+	}
+	return out, nil
+}
+
+// parseObjectiveCSV reads the file once, returning headers (including name)
+// and a map of name → [metric_1, metric_2, ...] values aligned to headers[1:].
+// Rows with any unparseable metric cell keep NaN for that slot; NaN-only scenes
+// will be filtered per-metric in sliceMetricColumn.
+func parseObjectiveCSV(path string) ([]string, map[string][]float64, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer f.Close()
+
+	r := csv.NewReader(f)
+	r.FieldsPerRecord = -1
+	records, err := r.ReadAll()
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(records) < 2 {
+		return nil, nil, errors.New("objective CSV has no data rows")
+	}
+	headers := records[0]
+	nMetrics := len(headers) - 1
+
+	out := make(map[string][]float64, len(records)-1)
+	for _, rec := range records[1:] {
+		if len(rec) == 0 {
+			continue
+		}
+		name := rec[0]
+		vec := make([]float64, nMetrics)
+		for j := 0; j < nMetrics; j++ {
+			if j+1 >= len(rec) {
+				vec[j] = math.NaN()
+				continue
+			}
+			v, err := strconv.ParseFloat(strings.TrimSpace(rec[j+1]), 64)
+			if err != nil {
+				vec[j] = math.NaN()
+				continue
+			}
+			vec[j] = v
+		}
+		out[name] = vec
+	}
+	return headers, out, nil
+}
+
+// sliceMetricColumn projects one metric column from the objective table,
+// dropping scenes whose value is NaN for that metric.
+func sliceMetricColumn(data map[string][]float64, col int) map[string]float64 {
+	out := make(map[string]float64, len(data))
+	for name, vec := range data {
+		if col >= len(vec) {
+			continue
+		}
+		v := vec[col]
+		if math.IsNaN(v) {
+			continue
+		}
+		out[name] = v
+	}
+	return out
+}
+
+// ---------------------------------------------------------------------------
+// Distribution sampling (beta with truncated-normal fallback)
+// ---------------------------------------------------------------------------
+
+func betaDistribution(rng *rand.Rand, mean, std, lower, upper float64, nSamples int) ([]float64, error) {
 	if mean <= 0 || std <= 0 {
 		samples := make([]float64, nSamples)
 		for i := range samples {
@@ -508,16 +464,13 @@ func betaDistribution(mean, std, lower, upper float64, nSamples int) ([]float64,
 		}
 		return samples, nil
 	}
-
 	if mean < lower || mean > upper {
 		return nil, errors.New("mean must be between lower and upper bounds")
 	}
 
-	// Rescale mean and variance to [0, 1] range
 	rescaledMean := (mean - lower) / (upper - lower)
 	rescaledVar := math.Pow(std/(upper-lower), 2)
 
-	// Check for near-zero variance
 	if rescaledVar < 1e-10 {
 		samples := make([]float64, nSamples)
 		for i := range samples {
@@ -526,12 +479,10 @@ func betaDistribution(mean, std, lower, upper float64, nSamples int) ([]float64,
 		return samples, nil
 	}
 
-	// Compute alpha and beta parameters
 	temp := (rescaledMean * (1 - rescaledMean) / rescaledVar) - 1
 	alpha := rescaledMean * temp
 	betaParam := (1 - rescaledMean) * temp
 
-	// Validate alpha and beta parameters
 	if alpha <= 0 || betaParam <= 0 {
 		samples := make([]float64, nSamples)
 		for i := range samples {
@@ -540,144 +491,91 @@ func betaDistribution(mean, std, lower, upper float64, nSamples int) ([]float64,
 		return samples, nil
 	}
 
-	// Use "golang.org/x/exp/rand" since gonum requires it
-	src := rand.NewSource(uint64(time.Now().UnixNano()))
-	rng := rand.New(src)
-
-	// Generate beta-distributed samples
 	betaDist := distuv.Beta{Alpha: alpha, Beta: betaParam, Src: rng}
 	samples := make([]float64, nSamples)
 	for i := 0; i < nSamples; i++ {
 		samples[i] = lower + betaDist.Rand()*(upper-lower)
 	}
-
 	return samples, nil
-
 }
 
-// Cached standard normal distribution and constant.
-var stdNorm = distuv.Normal{Mu: 0, Sigma: 1}
-var sqrt2Pi = math.Sqrt(2 * math.Pi)
+var (
+	stdNorm = distuv.Normal{Mu: 0, Sigma: 1}
+	sqrt2Pi = math.Sqrt(2 * math.Pi)
+)
 
-func standardNormalPDF(x float64) float64 {
-	return math.Exp(-0.5*x*x) / sqrt2Pi
-}
-
-func standardNormalCDF(x float64) float64 {
-	return stdNorm.CDF(x)
-}
+func standardNormalPDF(x float64) float64 { return math.Exp(-0.5*x*x) / sqrt2Pi }
+func standardNormalCDF(x float64) float64 { return stdNorm.CDF(x) }
 
 func adjustTruncatedNormalParams(targetMean, targetStd, lower, upper float64, maxIterations int, epsilon float64) (float64, float64) {
-	mu := targetMean
-	sigma := targetStd
+	mu, sigma := targetMean, targetStd
 
-	// Helper function to compute the truncated normal moments.
 	truncatedNormalMoments := func(mu, sigma, lower, upper float64) (float64, float64) {
 		if sigma < epsilon {
 			return mu, sigma
 		}
-
 		a := (lower - mu) / sigma
 		b := (upper - mu) / sigma
-
-		// Cache PDF and CDF values.
-		pdfA := standardNormalPDF(a)
-		pdfB := standardNormalPDF(b)
-		cdfA := standardNormalCDF(a)
-		cdfB := standardNormalCDF(b)
-
+		pdfA, pdfB := standardNormalPDF(a), standardNormalPDF(b)
+		cdfA, cdfB := standardNormalCDF(a), standardNormalCDF(b)
 		alpha := pdfA - pdfB
 		beta := cdfB - cdfA
-
 		if math.Abs(beta) < epsilon {
 			return mu, sigma
 		}
-
-		// Compute truncated mean.
 		truncatedMean := mu + (alpha/beta)*sigma
-
-		// Use multiplication instead of math.Pow for efficiency.
 		varianceTerm := math.Max(0, 1+((a*pdfA-b*pdfB)/beta)-(alpha*alpha)/(beta*beta))
 		truncatedVar := sigma * sigma * varianceTerm
-
 		return truncatedMean, math.Sqrt(truncatedVar)
 	}
 
-	// Iteratively adjust parameters.
 	for i := 0; i < maxIterations; i++ {
 		truncMean, truncStd := truncatedNormalMoments(mu, sigma, lower, upper)
 		mu += targetMean - truncMean
-
 		if truncStd < epsilon {
-			fmt.Printf("Warning: truncStd is very small (%.6f) at iteration %d. Stopping iterations.\n", truncStd, i)
+			fmt.Fprintf(os.Stderr, "Warning: truncStd very small (%.6f) at iter %d; stopping.\n", truncStd, i)
 			break
 		}
-
 		sigma *= targetStd / truncStd
 	}
 	return mu, sigma
 }
 
-// Old code
-// func truncatedNormalSamples(mean, std, lower, upper float64, nSamples int) []float64 {
-// 	rng := rand.New(rand.NewSource(uint64(time.Now().UnixNano())))
-// 	norm := distuv.Normal{Mu: mean, Sigma: std, Src: rng}
-
-// 	samples := make([]float64, 0, nSamples)
-// 	for len(samples) < nSamples {
-// 		sample := norm.Rand()
-// 		if sample >= lower && sample <= upper {
-// 			samples = append(samples, sample)
-// 		}
-// 	}
-// 	return samples
-// }
-
-func truncatedNormalSamplesQuantile(mean, std, lower, upper float64, nSamples int) []float64 {
-	// Create a normal distribution with the desired parameters.
+func truncatedNormalSamplesQuantile(rng *rand.Rand, mean, std, lower, upper float64, nSamples int) []float64 {
 	norm := distuv.Normal{Mu: mean, Sigma: std}
-	// Compute CDF values at the truncation boundaries.
 	cdfLower := norm.CDF(lower)
 	cdfUpper := norm.CDF(upper)
 	samples := make([]float64, nSamples)
 	for i := 0; i < nSamples; i++ {
-		// Draw a uniform random number in the [cdfLower, cdfUpper] interval.
-		u := rand.Float64()*(cdfUpper-cdfLower) + cdfLower
-		// Use the inverse CDF (Quantile) to obtain a sample from the truncated distribution.
+		u := rng.Float64()*(cdfUpper-cdfLower) + cdfLower
 		samples[i] = norm.Quantile(u)
 	}
 	return samples
 }
 
-// computeStats calculates the mean and standard deviation of a slice of float64 values.
 func computeStats(samples []float64) (float64, float64) {
 	n := float64(len(samples))
 	if n == 0 {
 		return 0, 0
 	}
-
-	// Compute mean
 	sum := 0.0
 	for _, v := range samples {
 		sum += v
 	}
 	mean := sum / n
-
-	// Compute standard deviation
-	varianceSum := 0.0
+	varSum := 0.0
 	for _, v := range samples {
-		varianceSum += (v - mean) * (v - mean)
+		d := v - mean
+		varSum += d * d
 	}
-	std := math.Sqrt(varianceSum / n)
-
-	return mean, std
+	return mean, math.Sqrt(varSum / n)
 }
 
-// getSamples generates samples with a sophisticated fallback mechanism.
-// It tries the beta distribution first, then falls back to a truncated normal distribution if necessary.
-func getSamples(mean, std float64, nSamples int, lower, upper float64) []float64 {
+// getSamples draws nSamples with beta distribution; if the fit is poor, adjusts
+// parameters and tries a truncated normal; returns whichever matches the target
+// mean/std more closely.
+func getSamples(rng *rand.Rand, mean, std float64, nSamples int, lower, upper float64) []float64 {
 	if std <= 0 {
-		// If std is zero or negative, return an array filled with the mean
 		samples := make([]float64, nSamples)
 		for i := range samples {
 			samples[i] = mean
@@ -685,110 +583,195 @@ func getSamples(mean, std float64, nSamples int, lower, upper float64) []float64
 		return samples
 	}
 
-	// Try generating samples from the beta distribution
-	samples, _ := betaDistribution(mean, std, lower, upper, nSamples)
+	samples, _ := betaDistribution(rng, mean, std, lower, upper, nSamples)
 	sampleMean, sampleStd := computeStats(samples)
 
-	// If the generated beta samples are too far from the target mean/std, adjust and switch to truncated normal
 	if math.Abs(sampleMean-mean) > 0.2 || math.Abs(sampleStd-std) > 0.1 {
-		adjustedMean, adjustedStd := adjustTruncatedNormalParams(mean, std, lower, upper, 100, 1e-8)
-		truncSamples := truncatedNormalSamplesQuantile(adjustedMean, adjustedStd, lower, upper, nSamples)
-
-		truncMean, truncStd := computeStats(truncSamples)
-
-		// Choose the distribution that better matches the target mean and std
-		if (math.Abs(sampleMean-mean) + math.Abs(sampleStd-std)) < (math.Abs(truncMean-mean) + math.Abs(truncStd-std)) {
-			return samples
-		} else {
-			return truncSamples
+		adjMean, adjStd := adjustTruncatedNormalParams(mean, std, lower, upper, 100, 1e-8)
+		tn := truncatedNormalSamplesQuantile(rng, adjMean, adjStd, lower, upper, nSamples)
+		tnMean, tnStd := computeStats(tn)
+		betaErr := math.Abs(sampleMean-mean) + math.Abs(sampleStd-std)
+		tnErr := math.Abs(tnMean-mean) + math.Abs(tnStd-std)
+		if tnErr < betaErr {
+			return tn
 		}
 	}
-
-	// If beta samples are already good enough, return them
 	return samples
 }
 
-// bootstrapVotes generates bootstrapped mean samples for a slice of votes.
-// For each iteration, it resamples the votes (with replacement) and computes the mean.
-func bootstrapVotes(votes []float64, nIterations int) []float64 {
+// ---------------------------------------------------------------------------
+// Bootstrap
+// ---------------------------------------------------------------------------
+
+func bootstrapVotes(rng *rand.Rand, votes []float64, nIterations int) []float64 {
 	n := len(votes)
 	if n == 0 {
 		return nil
 	}
 	results := make([]float64, nIterations)
+	invN := 1.0 / float64(n)
 	for i := 0; i < nIterations; i++ {
 		sum := 0.0
-		// Resample 'n' votes with replacement.
 		for j := 0; j < n; j++ {
-			index := rand.Intn(n)
-			sum += votes[index]
+			sum += votes[rng.Intn(n)]
 		}
-		results[i] = sum / float64(n)
+		results[i] = sum * invN
 	}
 	return results
 }
 
-// bootstrapResult is a helper type for sending results from workers.
-type bootstrapResult struct {
-	key   string
-	means []float64
-}
+// parallelBootstrap computes nIterations bootstrapped means per scene in parallel.
+func parallelBootstrap(sceneVotes map[string][]float64, nIterations int, seed uint64) map[string][]float64 {
+	keys := make([]string, 0, len(sceneVotes))
+	for k := range sceneVotes {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys) // deterministic work order for reproducibility
 
-// parallelBootstrap performs bootstrapping in parallel across the keys of sceneVotes.
-// It returns a map with the same keys and the corresponding bootstrapped mean samples.
-func parallelBootstrap(sceneVotes map[string][]float64, nIterations int, nProcesses int) map[string][]float64 {
-	// Use all available cores if nProcesses is not specified.
-	if nProcesses <= 0 {
-		nProcesses = runtime.NumCPU()
+	out := make(map[string][]float64, len(keys))
+	var mu sync.Mutex
+
+	numWorkers := runtime.NumCPU()
+	if numWorkers > len(keys) {
+		numWorkers = len(keys)
+	}
+	if numWorkers < 1 {
+		numWorkers = 1
 	}
 
-	// Channel for sending keys to process.
-	keysChan := make(chan string)
-	// Channel for collecting results.
-	resultsChan := make(chan bootstrapResult)
 	var wg sync.WaitGroup
+	wg.Add(numWorkers)
 
-	// Start worker goroutines.
-	for i := 0; i < nProcesses; i++ {
-		wg.Add(1)
-		go func() {
+	for w := 0; w < numWorkers; w++ {
+		go func(workerID int) {
 			defer wg.Done()
-			for key := range keysChan {
-				votes := sceneVotes[key]
-				bootstrapMeans := bootstrapVotes(votes, nIterations)
-				resultsChan <- bootstrapResult{key: key, means: bootstrapMeans}
+			rng := rand.New(rand.NewSource(seed ^ uint64(workerID+1)))
+			for i := workerID; i < len(keys); i += numWorkers {
+				key := keys[i]
+				means := bootstrapVotes(rng, sceneVotes[key], nIterations)
+				mu.Lock()
+				out[key] = means
+				mu.Unlock()
 			}
-		}()
+		}(w)
 	}
+	wg.Wait()
+	return out
+}
 
-	// Feed the keys into the keysChan.
-	go func() {
-		for key := range sceneVotes {
-			keysChan <- key
+// ---------------------------------------------------------------------------
+// Correlation computation on bootstrap samples
+// ---------------------------------------------------------------------------
+
+// computeCorrelationDistributions performs nBootstrap iterations in parallel.
+// Returns one slice of length nBootstrap per selected coefficient.
+func computeCorrelationDistributions(
+	subjective map[string][]float64,
+	objective map[string]float64,
+	nBootstrap int,
+	bootstrapScenes bool,
+	coeffs []coeffID,
+	seed uint64,
+) map[coeffID][]float64 {
+
+	// Intersect keys between subjective and objective.
+	keys := make([]string, 0, len(objective))
+	for k := range subjective {
+		if _, ok := objective[k]; ok {
+			keys = append(keys, k)
 		}
-		close(keysChan)
-	}()
-
-	// Close the results channel once all workers are done.
-	go func() {
-		wg.Wait()
-		close(resultsChan)
-	}()
-
-	// Gather results.
-	resultMap := make(map[string][]float64)
-	for res := range resultsChan {
-		resultMap[res.key] = res.means
 	}
-	return resultMap
+	sort.Strings(keys)
+
+	distributions := make(map[coeffID][]float64, len(coeffs))
+	for _, c := range coeffs {
+		distributions[c] = make([]float64, nBootstrap)
+	}
+
+	numWorkers := runtime.NumCPU()
+	if numWorkers > nBootstrap {
+		numWorkers = nBootstrap
+	}
+	if numWorkers < 1 {
+		numWorkers = 1
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(numWorkers)
+
+	// Stride partition so iteration i is always handled by worker (i % numWorkers).
+	// This keeps per-iteration RNG streams deterministic given a fixed seed.
+	for w := 0; w < numWorkers; w++ {
+		go func(workerID int) {
+			defer wg.Done()
+			rng := rand.New(rand.NewSource(seed ^ uint64(workerID+1)))
+			bootSubj := make([]float64, len(keys))
+			objRate := make([]float64, len(keys))
+			sampledKeys := make([]string, len(keys))
+			for i := workerID; i < nBootstrap; i += numWorkers {
+				runBootstrapIteration(rng, subjective, objective, keys, bootstrapScenes,
+					coeffs, distributions, i, bootSubj, objRate, sampledKeys)
+			}
+		}(w)
+	}
+	wg.Wait()
+
+	return distributions
 }
 
-// pearson computes the Pearson correlation coefficient.
-func pearson(x, y []float64) float64 {
-	return stat.Correlation(x, y, nil)
+// runBootstrapIteration executes a single outer bootstrap iteration, writing
+// results directly into distributions[coeff][i] (workers own non-overlapping i).
+func runBootstrapIteration(
+	rng *rand.Rand,
+	subjective map[string][]float64,
+	objective map[string]float64,
+	keys []string,
+	bootstrapScenes bool,
+	coeffs []coeffID,
+	distributions map[coeffID][]float64,
+	i int,
+	bootSubj, objRate []float64,
+	sampledKeys []string,
+) {
+	n := len(keys)
+
+	var active []string
+	if bootstrapScenes {
+		for j := 0; j < n; j++ {
+			sampledKeys[j] = keys[rng.Intn(n)]
+		}
+		active = sampledKeys
+	} else {
+		active = keys
+	}
+
+	for j, key := range active {
+		ratings := subjective[key]
+		bootSubj[j] = ratings[rng.Intn(len(ratings))] // single random bootstrapped mean per scene
+		objRate[j] = objective[key]
+	}
+
+	for _, c := range coeffs {
+		var v float64
+		switch c {
+		case pearsonID:
+			v = pearson(bootSubj, objRate)
+		case spearmanID:
+			v = spearman(bootSubj, objRate)
+		case kendallID:
+			v = kendall(bootSubj, objRate)
+		}
+		distributions[c][i] = math.Abs(v)
+	}
 }
 
-// rank returns the ranks (averaging ties) of the values in the slice.
+// ---------------------------------------------------------------------------
+// Correlation coefficients
+// ---------------------------------------------------------------------------
+
+func pearson(x, y []float64) float64 { return stat.Correlation(x, y, nil) }
+
+// rank assigns average ranks, handling ties.
 func rank(values []float64) []float64 {
 	type pair struct {
 		value float64
@@ -804,11 +787,10 @@ func rank(values []float64) []float64 {
 	ranks := make([]float64, n)
 	for i := 0; i < n; {
 		j := i + 1
-		// Handle ties by averaging their rank.
 		for j < n && pairs[j].value == pairs[i].value {
 			j++
 		}
-		avgRank := float64(i+j+1) / 2.0 // ranks are 1-indexed
+		avgRank := float64(i+j+1) / 2.0
 		for k := i; k < j; k++ {
 			ranks[pairs[k].index] = avgRank
 		}
@@ -817,14 +799,9 @@ func rank(values []float64) []float64 {
 	return ranks
 }
 
-// spearman computes the Spearman correlation coefficient.
-func spearman(x, y []float64) float64 {
-	rx := rank(x)
-	ry := rank(y)
-	return stat.Correlation(rx, ry, nil)
-}
+func spearman(x, y []float64) float64 { return stat.Correlation(rank(x), rank(y), nil) }
 
-// kendall computes Kendall's tau correlation coefficient (naively, O(n²)).
+// Kendall's tau-a (naive O(n²)).
 func kendall(x, y []float64) float64 {
 	n := len(x)
 	var concordant, discordant int
@@ -846,192 +823,61 @@ func kendall(x, y []float64) float64 {
 	return float64(concordant-discordant) / float64(total)
 }
 
-// mean computes the average of a slice.
-// func mean(arr []float64) float64 {
-// 	sum := 0.0
-// 	for _, v := range arr {
-// 		sum += v
-// 	}
-// 	return sum / float64(len(arr))
-// }
+// ---------------------------------------------------------------------------
+// CI / output
+// ---------------------------------------------------------------------------
 
-func processWrapperCombined(subjective map[string][]float64, objective map[string]float64,
-	bootstrapScenes bool, corrCoeffs []string, keys []string) []float64 {
-
-	var sampledKeys []string
-	n := len(keys)
-	if bootstrapScenes {
-		// Sample scenes with replacement.
-		sampledKeys = make([]string, n)
-		for i := 0; i < n; i++ {
-			sampledKeys[i] = keys[rand.Intn(n)]
-		}
-	} else {
-		sampledKeys = keys
-	}
-
-	// For each scene, compute the mean of its subjective ratings.
-	bootSubjective := make([]float64, len(sampledKeys))
-	objRatings := make([]float64, len(sampledKeys))
-	for i, key := range sampledKeys {
-		ratings := subjective[key]
-
-		// Pick a random index and retrieve the value.
-		index := rand.Intn(len(ratings))
-		randomValue := ratings[index]
-		// bootSubjective[i] = mean(ratings)
-
-		bootSubjective[i] = randomValue // THIS PART IS IMPORTANT!
-		objRatings[i] = objective[key]
-	}
-
-	results := make([]float64, 0, len(corrCoeffs))
-	for _, coeff := range corrCoeffs {
-		lc := strings.ToLower(coeff)
-		if lc == "pearson" || coeff == "r" {
-			results = append(results, math.Abs(pearson(bootSubjective, objRatings)))
-		}
-		if lc == "spearman" || coeff == "rho" {
-			results = append(results, math.Abs(spearman(bootSubjective, objRatings)))
-		}
-		if lc == "kendall" || coeff == "tau" {
-			results = append(results, math.Abs(kendall(bootSubjective, objRatings)))
-		}
-	}
-	return results
-}
-
-// computeCorrelationDistributions performs nBootstrap iterations in parallel.
-// It returns a map where each key is the name of a correlation coefficient and the value
-// is a slice of its bootstrapped (absolute) values.
-func computeCorrelationDistributions(subjective map[string][]float64, objective map[string]float64,
-	nBootstrap int, bootstrapScenes bool, corrCoeffs []string) map[string][]float64 {
-
-	// Extract common keys.
-	var keys []string
-	for k := range subjective {
-		if _, ok := objective[k]; ok {
-			keys = append(keys, k)
-		}
-	}
-	sort.Strings(keys)
-
-	// Prepare the results storage.
-	distributions := make(map[string][]float64)
-	for _, coeff := range corrCoeffs {
-		distributions[coeff] = make([]float64, nBootstrap)
-	}
-
-	bootstrapResults := make([][]float64, nBootstrap)
-	numWorkers := runtime.NumCPU()
-	jobs := make(chan int, nBootstrap)
-	var wg sync.WaitGroup
-
-	worker := func() {
-		defer wg.Done()
-		for i := range jobs {
-			bootstrapResults[i] = processWrapperCombined(subjective, objective, bootstrapScenes, corrCoeffs, keys)
-		}
-	}
-
-	// Launch workers.
-	for w := 0; w < numWorkers; w++ {
-		wg.Add(1)
-		go worker()
-	}
-
-	for i := 0; i < nBootstrap; i++ {
-		jobs <- i
-	}
-	close(jobs)
-	wg.Wait()
-
-	// Aggregate results.
-	for i := 0; i < nBootstrap; i++ {
-		res := bootstrapResults[i]
-		for j, coeff := range corrCoeffs {
-			distributions[coeff][i] = res[j]
-		}
-	}
-	return distributions
-}
-
-// computeMeanCorrelation calculates correlation between mean subjective ratings and objective scores.
-func computeMeanCorrelation(subjective map[string][]float64, objective map[string]float64) map[string]float64 {
-	var means []float64
-	var objValues []float64
-
-	for key, scores := range subjective {
-		if obj, exists := objective[key]; exists {
-			// Compute mean of subjective scores
-			var sum float64
-			for _, score := range scores {
-				sum += score
-			}
-			mean := sum / float64(len(scores))
-
-			means = append(means, mean)
-			objValues = append(objValues, obj)
-		}
-	}
-
-	// Compute correlations
-	results := map[string]float64{
-		"pearson":  pearson(means, objValues),
-		"spearman": spearman(means, objValues),
-		"kendall":  kendall(means, objValues),
-	}
-
-	return results
-}
-
-// bootstrapConfidenceInterval computes the mean, lower (2.5th percentile),
-// and upper (97.5th percentile) from a slice of values.
 func bootstrapConfidenceInterval(data []float64) (mean, lower, upper float64) {
 	n := len(data)
 	if n == 0 {
 		return 0, 0, 0
 	}
-
-	// Compute mean.
 	sum := 0.0
 	for _, v := range data {
 		sum += v
 	}
 	mean = sum / float64(n)
 
-	// Copy and sort the data.
-	sortedData := make([]float64, n)
-	copy(sortedData, data)
-	sort.Float64s(sortedData)
+	sorted := make([]float64, n)
+	copy(sorted, data)
+	sort.Float64s(sorted)
 
-	// Compute indices for the 2.5% and 97.5% percentiles.
-	lowerIndex := int(0.025 * float64(n))
-	upperIndex := int(0.975 * float64(n))
-	// Ensure indices are within bounds.
-	if lowerIndex < 0 {
-		lowerIndex = 0
+	li := int(0.025 * float64(n))
+	ui := int(0.975 * float64(n))
+	if li < 0 {
+		li = 0
 	}
-	if upperIndex >= n {
-		upperIndex = n - 1
+	if ui >= n {
+		ui = n - 1
 	}
+	return mean, sorted[li], sorted[ui]
+}
 
-	lower = sortedData[lowerIndex]
-	upper = sortedData[upperIndex]
-	return
+func buildOutputPath(outputDir, prefix, metric, coeffName string) (string, error) {
+	name := coeffName + ".txt"
+	if prefix != "" {
+		name = prefix + "_" + metric + "_" + name
+	}
+	if outputDir != "" {
+		if err := ensureDirExists(outputDir); err != nil {
+			return "", fmt.Errorf("ensure dir: %w", err)
+		}
+		return filepath.Join(outputDir, name), nil
+	}
+	return name, nil
 }
 
 func saveToText(filename string, data []float64) error {
-	file, err := os.Create(filename)
+	f, err := os.Create(filename)
 	if err != nil {
 		return err
 	}
-	defer file.Close()
+	defer f.Close()
 
-	// Write each value on a new line
-	for _, value := range data {
-		_, err := fmt.Fprintf(file, "%f\n", value)
-		if err != nil {
+	bw := bufio.NewWriter(f)
+	defer bw.Flush()
+	for _, v := range data {
+		if _, err := fmt.Fprintf(bw, "%f\n", v); err != nil {
 			return err
 		}
 	}
@@ -1039,97 +885,78 @@ func saveToText(filename string, data []float64) error {
 }
 
 func ensureDirExists(path string) error {
-	_, err := os.Stat(path)
-	if err == nil {
-		// Path exists, nothing to do
+	if _, err := os.Stat(path); err == nil {
 		return nil
+	} else if !os.IsNotExist(err) {
+		return err
 	}
-	if os.IsNotExist(err) {
-		// Path does not exist, create it
-		err = os.MkdirAll(path, os.ModeDir|0755) // Creates the directory and any necessary parent directories
-		if err != nil {
-			fmt.Println("Error creating directory:", err)
-			return err
-		}
-		return nil
-	}
-	// Some other error occurred
-	fmt.Println("Error checking path:", err)
-	return err
+	return os.MkdirAll(path, 0o755)
 }
 
-// CombineTxtToCSV combines all .txt files in the specified directory into a single CSV file
-// with each column named after the source text file
+// CombineTxtToCSV merges per-metric .txt distribution files into one CSV,
+// one column per metric. Columns may be of unequal length; missing cells are blank.
 func CombineTxtToCSV(fileMap map[string]string, outputPath string, csvName string) error {
+	// Stable header order: sorted by metric name.
+	headers := make([]string, 0, len(fileMap))
+	for h := range fileMap {
+		headers = append(headers, h)
+	}
+	sort.Strings(headers)
 
-	// Read data from each file
-	fileData := make(map[string][]string)
+	columns := make([][]string, len(headers))
 	maxLines := 0
-
-	for metric, fullPath := range fileMap {
-
-		// Read file content
-		content, err := os.Open(fullPath)
+	for i, metric := range headers {
+		lines, err := readLines(fileMap[metric])
 		if err != nil {
-			return fmt.Errorf("Error opening file %s: %v", fullPath, err)
+			return fmt.Errorf("read %s: %w", fileMap[metric], err)
 		}
-		defer content.Close()
-
-		// Read lines
-		var lines []string
-		scanner := bufio.NewScanner(content)
-		for scanner.Scan() {
-			lines = append(lines, scanner.Text())
-		}
-
-		if err := scanner.Err(); err != nil {
-			return fmt.Errorf("error reading file %s: %v", fullPath, err)
-		}
-
-		fileData[metric] = lines
-
-		// Track the maximum number of lines
+		columns[i] = lines
 		if len(lines) > maxLines {
 			maxLines = len(lines)
 		}
 	}
 
-	// Prepare CSV data with headers
-	headers := make([]string, 0, len(fileData))
-	for header := range fileData {
-		headers = append(headers, header)
-	}
-
-	// Create output CSV file in the same directory
 	outputFile := filepath.Join(outputPath, csvName)
-	file, err := os.Create(outputFile)
+	f, err := os.Create(outputFile)
 	if err != nil {
-		return fmt.Errorf("error creating output file: %v", err)
+		return fmt.Errorf("create %s: %w", outputFile, err)
 	}
-	defer file.Close()
+	defer f.Close()
 
-	writer := csv.NewWriter(file)
-	defer writer.Flush()
+	w := csv.NewWriter(f)
+	defer w.Flush()
 
-	// Write headers
-	if err := writer.Write(headers); err != nil {
-		return fmt.Errorf("Error writing headers: %v", err)
+	if err := w.Write(headers); err != nil {
+		return fmt.Errorf("write header: %w", err)
 	}
 
-	// Write data rows
+	row := make([]string, len(headers))
 	for i := 0; i < maxLines; i++ {
-		row := make([]string, len(headers))
-		for j, header := range headers {
-			if i < len(fileData[header]) {
-				row[j] = fileData[header][i]
+		for j, col := range columns {
+			if i < len(col) {
+				row[j] = col[i]
 			} else {
-				row[j] = "" // Fill with empty string if this column has fewer rows
+				row[j] = ""
 			}
 		}
-		if err := writer.Write(row); err != nil {
-			return fmt.Errorf("Error writing row: %v", err)
+		if err := w.Write(row); err != nil {
+			return fmt.Errorf("write row: %w", err)
 		}
 	}
-
 	return nil
+}
+
+func readLines(path string) ([]string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	var lines []string
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 64*1024), 1<<20)
+	for sc.Scan() {
+		lines = append(lines, sc.Text())
+	}
+	return lines, sc.Err()
 }
